@@ -22,6 +22,9 @@ async function loadData(){
  }
 }
 const sessions=new Map();
+const accessKey=crypto.scryptSync(ADMIN_PASSWORD,'estacion-gps-code-v1',32);
+function encryptCode(code){const iv=crypto.randomBytes(12),cipher=crypto.createCipheriv('aes-256-gcm',accessKey,iv);const ct=Buffer.concat([cipher.update(code,'utf8'),cipher.final()]);return [iv.toString('base64url'),cipher.getAuthTag().toString('base64url'),ct.toString('base64url')].join('.')}
+function decryptCode(saved){const [iv,tag,ct]=String(saved).split('.');if(!iv||!tag||!ct)throw Error('Código no disponible');const decipher=crypto.createDecipheriv('aes-256-gcm',accessKey,Buffer.from(iv,'base64url'));decipher.setAuthTag(Buffer.from(tag,'base64url'));return Buffer.concat([decipher.update(Buffer.from(ct,'base64url')),decipher.final()]).toString('utf8')}
 function hash(s,salt){return crypto.scryptSync(s,salt,64).toString('hex')}
 function verify(s,salt,digest){let a=Buffer.from(hash(s,salt),'hex'),b=Buffer.from(digest,'hex');return a.length===b.length&&crypto.timingSafeEqual(a,b)}
 function json(res,status,obj){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(JSON.stringify(obj))}
@@ -36,17 +39,22 @@ if(req.method==='POST'&&u.pathname==='/api/login'){const b=await body(req);if(b.
 const auth=getAuth(req);if(!auth)return json(res,401,{error:'Debes iniciar sesión'});
 if(req.method==='GET'&&u.pathname==='/api/state'){if(auth.role==='admin')return json(res,200,{riders:data.riders.map(sanitizeRider),shifts:data.shifts});const r=data.riders.find(x=>x.id===auth.id);return json(res,200,{me:sanitizeRider(r),shifts:data.shifts.filter(s=>s.riderId===auth.id)})}
 if(req.method==='GET'&&u.pathname==='/api/route'){const id=auth.role==='admin'?u.searchParams.get('id'):auth.id;const shift=u.searchParams.get('shift');if(auth.role!=='admin'&&id!==auth.id)return json(res,403,{error:'Prohibido'});return json(res,200,{points:data.points.filter(p=>p.riderId===id&&(!shift||p.shiftId===shift)).slice(-1500)})}
-if(req.method==='POST'&&u.pathname==='/api/riders'&&auth.role==='admin'){const b=await body(req);const name=String(b.name||'').trim().slice(0,60);if(!name)return json(res,400,{error:'Ingresa el nombre'});const code=crypto.randomBytes(9).toString('base64url');const salt=crypto.randomBytes(16).toString('hex');const r={id:crypto.randomUUID(),name,codeSalt:salt,codeHash:hash(code,salt),active:false,status:'Desconectado',lat:null,lon:null,accuracy:null,lastSeen:null,started:null};data.riders.push(r);await save();return json(res,200,{rider:sanitizeRider(r),code})}
+if(req.method==='POST'&&u.pathname==='/api/riders'&&auth.role==='admin'){const b=await body(req);const name=String(b.name||'').trim().slice(0,60);if(!name)return json(res,400,{error:'Ingresa el nombre'});const code=crypto.randomBytes(9).toString('base64url');const salt=crypto.randomBytes(16).toString('hex');const r={id:crypto.randomUUID(),name,codeSalt:salt,codeHash:hash(code,salt),codeEncrypted:encryptCode(code),active:false,status:'Desconectado',lat:null,lon:null,accuracy:null,lastSeen:null,started:null};data.riders.push(r);await save();return json(res,200,{rider:sanitizeRider(r),code})}
+if(req.method==='GET'&&u.pathname==='/api/rider-code'&&auth.role==='admin'){
+ const rider=data.riders.find(x=>x.id===u.searchParams.get('id'));if(!rider)return json(res,404,{error:'Repartidor no encontrado'});
+ if(!rider.codeEncrypted)return json(res,409,{error:'Código anterior no recuperable. Restablécelo una sola vez.'});
+ try{return json(res,200,{code:decryptCode(rider.codeEncrypted)})}catch{return json(res,409,{error:'No se puede leer el código tras cambiar la contraseña de administrador. Restablécelo.'})}
+}
 if(req.method==='POST'&&u.pathname==='/api/reset-code'&&auth.role==='admin'){
  const b=await body(req),r=data.riders.find(x=>x.id===b.id);
  if(!r)return json(res,404,{error:'Repartidor no encontrado'});
  const code=crypto.randomBytes(12).toString('base64url');
  const salt=crypto.randomBytes(16).toString('hex');
- const oldHash=r.codeHash,oldSalt=r.codeSalt,oldActive=r.active,oldStatus=r.status,oldStarted=r.started;
+ const oldHash=r.codeHash,oldSalt=r.codeSalt,oldEncrypted=r.codeEncrypted,oldActive=r.active,oldStatus=r.status,oldStarted=r.started;
  const sh=data.shifts.findLast(s=>s.riderId===r.id&&!s.end),oldEnd=sh?.end;
- r.codeSalt=salt;r.codeHash=hash(code,salt);
+ r.codeSalt=salt;r.codeHash=hash(code,salt);r.codeEncrypted=encryptCode(code);
  if(r.active){r.active=false;r.status='Desconectado';r.started=null;if(sh)sh.end=new Date().toISOString()}
- try{await save()}catch(e){r.codeHash=oldHash;r.codeSalt=oldSalt;r.active=oldActive;r.status=oldStatus;r.started=oldStarted;if(sh)sh.end=oldEnd;throw e}
+ try{await save()}catch(e){r.codeHash=oldHash;r.codeSalt=oldSalt;r.codeEncrypted=oldEncrypted;r.active=oldActive;r.status=oldStatus;r.started=oldStarted;if(sh)sh.end=oldEnd;throw e}
  for(const [k,s] of sessions)if(s.id===r.id)sessions.delete(k);
  return json(res,200,{code,name:r.name});
 }
